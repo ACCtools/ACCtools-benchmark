@@ -1,0 +1,6 @@
+cancer_prefix,raw_read
+H2009,/home/hyunwoo/54_Cancer_denovo_genome/sra_data/SRR28305172_subreads.fastq.gz
+HCC1954,/home/hyunwoo/54_Cancer_denovo_genome/sra_data/SRR28305163_subreads.fastq.gz
+H1437,/home/hyunwoo/54_Cancer_denovo_genome/sra_data/SRR28305179_subreads.fastq.gz
+HCC1937,/home/hyunwoo/54_Cancer_denovo_genome/sra_data/SRR28305185_subreads.fastq.gz
+HCC1395,/home/hyunwoo/54_Cancer_denovo_genome/sra_data/HCC1395_pacbio.fastq.gz
