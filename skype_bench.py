@@ -478,6 +478,7 @@ def command_for_case(
             sample.cell_line,
             "--reference",
             "hs1",
+            "--option_02=--variant_mode",
             "--skype_force",
             "-t",
             str(THREAD),
