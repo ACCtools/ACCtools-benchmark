@@ -466,6 +466,36 @@ def selected_cases(
     return cases
 
 
+def limit_vcf_cases(
+    cases: list[tuple[Sample, str]],
+    max_vcfs: int | None,
+    status: dict[str, Any] | None = None,
+    force: bool = False,
+) -> list[tuple[Sample, str]]:
+    if max_vcfs is None:
+        return cases
+
+    limited: list[tuple[Sample, str]] = []
+    selected_vcfs = 0
+    completed_runs = status["runs"] if status is not None else {}
+    for sample, method in cases:
+        if method == "skype":
+            limited.append((sample, method))
+            continue
+        if (
+            not force
+            and completed_metrics(
+                completed_runs.get(run_key(sample.cell_line, method))
+            )
+            is not None
+        ):
+            limited.append((sample, method))
+        elif selected_vcfs < max_vcfs:
+            limited.append((sample, method))
+            selected_vcfs += 1
+    return limited
+
+
 def command_for_case(
     sample: Sample, method: str, results_dir: Path
 ) -> tuple[list[str], Path, Path, bool, Path | None]:
@@ -621,6 +651,15 @@ def parse_args() -> argparse.Namespace:
         help="Run only this karyotype type; repeat to select multiple types.",
     )
     parser.add_argument(
+        "--max-vcfs",
+        type=int,
+        metavar="N",
+        help=(
+            "Run at most N pending VCF cases across all cell lines; "
+            "completed checkpoints and native skype cases do not count."
+        ),
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Rerun completed selected cases; previous artifacts are preserved.",
@@ -640,6 +679,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.max_vcfs is not None and args.max_vcfs < 1:
+        raise BenchError("--max-vcfs must be at least 1")
     input_csv = absolute_path(args.input)
     vcf_root = absolute_path(args.vcf_root)
     results_dir = absolute_path(args.results_dir)
@@ -664,6 +705,9 @@ def main() -> int:
     cases = selected_cases(samples, selected_cells, selected_methods)
     if not cases:
         raise BenchError("no benchmark cases selected")
+
+    if args.dry_run:
+        cases = limit_vcf_cases(cases, args.max_vcfs)
 
     print(
         f"Validated {len(samples)} cell lines, 11 VCFs per cell; "
@@ -692,6 +736,7 @@ def main() -> int:
 
         status_path = results_dir / "status.json"
         status = load_status(status_path)
+        cases = limit_vcf_cases(cases, args.max_vcfs, status, args.force)
         failures = 0
         cleaned_cells: set[str] = set()
 
