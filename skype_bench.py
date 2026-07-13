@@ -73,6 +73,11 @@ SNAPSHOT_FILES = (
     "SKYPE_result.bed",
     "SKYPE_result_filter.bed",
     "SKYPE_result_cluster.bed",
+    "total_cov.png",
+    "virtual_sky.png",
+    "*.paf.ppc.paf",
+    "compressed_nclose_nodes_list.txt",
+    "all_nclose_nodes_list.txt",
     "report.txt",
     "pipeline_mode.pkl",
 )
@@ -379,11 +384,11 @@ def snapshot_output(source: Path, destination: Path, metadata: dict[str, Any]) -
         destination.rename(unique_backup_path(destination))
     destination.mkdir(parents=True, exist_ok=False)
     copied: list[str] = []
-    for name in SNAPSHOT_FILES:
-        source_path = source / name
-        if source_path.is_file():
-            shutil.copy2(source_path, destination / name)
-            copied.append(name)
+    for pattern in SNAPSHOT_FILES:
+        for source_path in sorted(source.glob(pattern)):
+            if source_path.is_file():
+                shutil.copy2(source_path, destination / source_path.name)
+                copied.append(source_path.name)
     if not copied:
         raise BenchError(f"no benchmark artifacts found to snapshot in {source}")
     manifest = dict(metadata)
