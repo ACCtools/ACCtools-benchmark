@@ -47,12 +47,13 @@ from typing import Any, Iterable
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+WORKSPACE_ROOT = PROJECT_ROOT.parent
 THREAD = 50
 DEPTH = 1
 MAMBA_BIN_DIR = Path("/home/hyunwoo/.mamba/bin")
 SKYPE_ENV_BIN = Path("/hyunwoo/.mamba/envs/skype/bin")
 SKYPE_PYTHON = SKYPE_ENV_BIN / "python"
-ACCTOOLS_SKYPE = PROJECT_ROOT / "ACCtools-pipeline" / "SKYPE.py"
+ACCTOOLS_SKYPE = WORKSPACE_ROOT / "ACCtools-pipeline" / "SKYPE.py"
 DATA_ROOT = Path("/Data/hyunwoo/00_skype_run_data")
 SNAPSHOT_FILES = (
     "karyotype.txt",
@@ -416,12 +417,12 @@ def run_pipeline(command: list[str], log_path: Path) -> tuple[int, int, str, str
 
     with log_path.open("w", encoding="utf-8") as log_handle:
         log_handle.write(f"# started_at={started_at}\n")
-        log_handle.write(f"# cwd={PROJECT_ROOT}\n")
+        log_handle.write(f"# cwd={WORKSPACE_ROOT}\n")
         log_handle.write(f"# command={shlex.join(command)}\n")
         log_handle.flush()
         process = subprocess.Popen(
             command,
-            cwd=PROJECT_ROOT,
+            cwd=WORKSPACE_ROOT,
             env=pipeline_environment(),
             stdout=log_handle,
             stderr=subprocess.STDOUT,
@@ -584,7 +585,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--vcf-root",
         type=Path,
-        default=PROJECT_ROOT / "variant_calls_and_benchmarks",
+        default=WORKSPACE_ROOT / "variant_calls_and_benchmarks",
         help="Root containing CELL_LINE/CELL_LINE/*.vcf.",
     )
     parser.add_argument(
@@ -598,7 +599,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--results-dir",
         type=Path,
-        default=PROJECT_ROOT / "skype_bench_results",
+        default=WORKSPACE_ROOT / "skype_bench_results",
         help="Logs, checkpoints, and compact VCF artifacts.",
     )
     parser.add_argument(
