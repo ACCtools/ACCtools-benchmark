@@ -476,7 +476,7 @@ def limit_vcf_cases(
         return cases
 
     limited: list[tuple[Sample, str]] = []
-    selected_vcfs = 0
+    selected_vcfs: dict[str, int] = {}
     completed_runs = status["runs"] if status is not None else {}
     for sample, method in cases:
         if method == "skype":
@@ -490,9 +490,11 @@ def limit_vcf_cases(
             is not None
         ):
             limited.append((sample, method))
-        elif selected_vcfs < max_vcfs:
+        elif selected_vcfs.get(sample.cell_line, 0) < max_vcfs:
             limited.append((sample, method))
-            selected_vcfs += 1
+            selected_vcfs[sample.cell_line] = (
+                selected_vcfs.get(sample.cell_line, 0) + 1
+            )
     return limited
 
 
@@ -655,8 +657,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         metavar="N",
         help=(
-            "Run at most N pending VCF cases across all cell lines; "
-            "completed checkpoints and native skype cases do not count."
+            "Run at most N pending VCF cases per cell line; completed "
+            "checkpoints and native skype cases do not count."
         ),
     )
     parser.add_argument(
