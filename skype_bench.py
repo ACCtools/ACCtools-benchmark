@@ -4,9 +4,11 @@
 For every row in cancer_raw_reads.csv this script runs:
 
 * ``ACCtools-pipeline/SKYPE.py run_hifi`` directly once for the native,
-  assembly-driven SKYPE result using the HS1 reference.
+  assembly-driven SKYPE result using the HS1 reference.  This run is always
+  the first case and supplies its successful graph ``limit_combinations``.
 * ``ACCtools-pipeline/SKYPE.py run_hifi`` directly for each of the four HiFi,
-  four ONT, and three Illumina caller VCFs.
+  four ONT, and three Illumina caller VCFs.  Every VCF case uses exactly the
+  native graph-limit combination and fails without trying a fallback.
 
 The requested summary is written to ``skype_bench_results/skype_bench.csv`` by
 default.  Runs are logged separately and checkpointed in
@@ -22,7 +24,9 @@ Metric definitions:
 
 * nclose_count: number of entries in nclose_nodes_index.txt
 * indel_count: native type-4 indels, or VCF-mode used_type4_events
-* relative_error: the base ``Relative error`` emitted by 23_run_nnls.py
+* denoised_relative_error: ``Denoised relative error`` emitted by
+  23_run_nnls.py, using the CASTLE-HiFi-calibrated chromosome/run-wise TV
+  target with ``lambda = 3 * noise_sigma``
 """
 
 from __future__ import annotations
@@ -48,8 +52,10 @@ from typing import Any, Iterable
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 WORKSPACE_ROOT = PROJECT_ROOT.parent
-THREAD = 50
-DEPTH = 1
+
+THREAD = 16
+DEPTH = 2
+
 MAMBA_BIN_DIR = Path("/home/hyunwoo/.mamba/bin")
 SKYPE_ENV_BIN = Path("/hyunwoo/.mamba/envs/skype/bin")
 SKYPE_PYTHON = SKYPE_ENV_BIN / "python"
@@ -80,16 +86,18 @@ SNAPSHOT_FILES = (
     "all_nclose_nodes_list.txt",
     "report.txt",
     "pipeline_mode.pkl",
+    "limit_combinations.json",
 )
 CSV_COLUMNS = (
     "cell_line",
     "karyotype_type",
     "nclose_count",
     "indel_count",
-    "relative_error",
+    "denoised_relative_error",
 )
 STATUS_VERSION = 1
 CELL_PIPELINE_OUTPUT_DIRS = ("30_skype", "31_skype_hg38")
+LIMIT_COMBINATIONS_JSON = "limit_combinations.json"
 
 
 @dataclass(frozen=True)
@@ -149,6 +157,57 @@ def require_nonempty_file(path: Path, description: str) -> None:
 def require_file(path: Path, description: str) -> None:
     if not path.is_file():
         raise BenchError(f"{description} not found: {path}")
+
+
+def validate_limit_combinations(
+    value: object, description: str
+) -> tuple[int, int]:
+    if (
+        not isinstance(value, (list, tuple))
+        or len(value) != 2
+        or any(type(item) is not int for item in value)
+    ):
+        raise BenchError(f"{description} must be a pair of integers")
+    chr_limit, dir_limit = value
+    if chr_limit < 1 or dir_limit not in (0, 1):
+        raise BenchError(f"invalid {description}: {value!r}")
+    return chr_limit, dir_limit
+
+
+def read_limit_combinations(path: Path) -> tuple[int, int]:
+    require_nonempty_file(path, "limit_combinations output")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise BenchError(
+            f"could not read limit_combinations from {path}: {exc}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise BenchError(f"malformed limit_combinations output: {path}")
+    return validate_limit_combinations(
+        data.get("limit_combinations"), f"limit_combinations in {path}"
+    )
+
+
+def record_limit_combinations(record: object) -> tuple[int, int] | None:
+    if not isinstance(record, dict):
+        return None
+    try:
+        return validate_limit_combinations(
+            record.get("limit_combinations"), "checkpoint limit_combinations"
+        )
+    except BenchError:
+        return None
+
+
+def native_limit_combinations_path(results_dir: Path, cell_line: str) -> Path:
+    return (
+        results_dir
+        / "artifacts"
+        / cell_line
+        / "skype"
+        / LIMIT_COMBINATIONS_JSON
+    )
 
 
 def read_samples(input_csv: Path, vcf_root: Path) -> list[Sample]:
@@ -242,13 +301,68 @@ def completed_metrics(record: object) -> dict[str, Any] | None:
     metrics = record.get("metrics")
     if not isinstance(metrics, dict):
         return None
+    # A legacy checkpoint has only ``relative_error``.  Treat it as pending so
+    # the pipeline is rerun and actually emits the new denoised metric; deriving
+    # it from the rounded legacy log value would not be possible.
     if not all(column in metrics for column in CSV_COLUMNS[2:]):
+        return None
+    # Runs produced before native graph limits were recorded are not
+    # comparable with the new benchmark protocol and must be rerun.
+    if record_limit_combinations(record) is None:
+        return None
+    return metrics
+
+
+def native_limit_combinations_from_status(
+    status: dict[str, Any], sample: Sample, results_dir: Path
+) -> tuple[int, int]:
+    native_record = status["runs"].get(run_key(sample.cell_line, "skype"))
+    if completed_metrics(native_record) is None:
+        raise BenchError(
+            f"native skype prerequisite is not complete for {sample.cell_line}"
+        )
+
+    recorded = record_limit_combinations(native_record)
+    if recorded is None:
+        raise BenchError(
+            f"native skype checkpoint has no limit_combinations for {sample.cell_line}"
+        )
+    artifact_path = native_limit_combinations_path(results_dir, sample.cell_line)
+    artifact_value = read_limit_combinations(artifact_path)
+    if artifact_value != recorded:
+        raise BenchError(
+            f"native limit_combinations mismatch for {sample.cell_line}: "
+            f"checkpoint={recorded}, artifact={artifact_value}"
+        )
+    return artifact_value
+
+
+def completed_case_metrics(
+    record: object,
+    sample: Sample,
+    method: str,
+    status: dict[str, Any],
+    results_dir: Path,
+) -> dict[str, Any] | None:
+    metrics = completed_metrics(record)
+    if metrics is None:
+        return None
+    try:
+        native_limits = native_limit_combinations_from_status(
+            status, sample, results_dir
+        )
+    except BenchError:
+        return None
+    if record_limit_combinations(record) != native_limits:
         return None
     return metrics
 
 
 def write_summary_csv(
-    output_csv: Path, samples: Iterable[Sample], status: dict[str, Any]
+    output_csv: Path,
+    samples: Iterable[Sample],
+    status: dict[str, Any],
+    results_dir: Path,
 ) -> int:
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     temporary = output_csv.with_name(f".{output_csv.name}.tmp-{os.getpid()}")
@@ -260,7 +374,13 @@ def write_summary_csv(
         writer.writeheader()
         for sample in samples:
             for method in METHOD_ORDER:
-                metrics = completed_metrics(runs.get(run_key(sample.cell_line, method)))
+                metrics = completed_case_metrics(
+                    runs.get(run_key(sample.cell_line, method)),
+                    sample,
+                    method,
+                    status,
+                    results_dir,
+                )
                 if metrics is None:
                     continue
                 writer.writerow(
@@ -269,7 +389,9 @@ def write_summary_csv(
                         "karyotype_type": method,
                         "nclose_count": metrics["nclose_count"],
                         "indel_count": metrics["indel_count"],
-                        "relative_error": f'{float(metrics["relative_error"]):.4f}',
+                        "denoised_relative_error": (
+                            f'{float(metrics["denoised_relative_error"]):.4f}'
+                        ),
                     }
                 )
                 rows_written += 1
@@ -311,22 +433,22 @@ def count_native_indels(path: Path) -> int:
     return sum(len(group) for group in data)
 
 
-RELATIVE_ERROR_RE = re.compile(
-    r"(?:^|\s)INFO:\s*Relative error\s*:\s*"
+DENOISED_RELATIVE_ERROR_RE = re.compile(
+    r"(?:^|\s)INFO:\s*Denoised relative error\s*:\s*"
     r"([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)\s*$"
 )
 
 
-def read_relative_error(log_path: Path) -> float:
+def read_denoised_relative_error(log_path: Path) -> float:
     require_nonempty_file(log_path, "pipeline log")
     values: list[float] = []
     with log_path.open(encoding="utf-8", errors="replace") as handle:
         for line in handle:
-            match = RELATIVE_ERROR_RE.search(line)
+            match = DENOISED_RELATIVE_ERROR_RE.search(line)
             if match:
                 values.append(float(match.group(1)))
     if not values:
-        raise BenchError(f"base Relative error was not found in {log_path}")
+        raise BenchError(f"Denoised relative error was not found in {log_path}")
     return values[-1]
 
 
@@ -350,12 +472,16 @@ def collect_metrics(output_dir: Path, log_path: Path, vcf_mode: bool) -> dict[st
     return {
         "nclose_count": nclose_count,
         "indel_count": indel_count,
-        "relative_error": read_relative_error(log_path),
+        "denoised_relative_error": read_denoised_relative_error(log_path),
     }
 
 
 def ensure_fresh_output(output_dir: Path, vcf_mode: bool, started_ns: int) -> None:
-    required = [output_dir / "nclose_nodes_index.txt", output_dir / "karyotype.txt"]
+    required = [
+        output_dir / "nclose_nodes_index.txt",
+        output_dir / "karyotype.txt",
+        output_dir / LIMIT_COMBINATIONS_JSON,
+    ]
     if vcf_mode:
         required.append(output_dir / "vcf_mode_summary.tsv")
     else:
@@ -457,11 +583,14 @@ def selected_cases(
     samples: list[Sample], selected_cells: set[str] | None, selected_methods: set[str]
 ) -> list[tuple[Sample, str]]:
     cases: list[tuple[Sample, str]] = []
+    needs_native_limits = any(method != "skype" for method in selected_methods)
     for sample in samples:
         if selected_cells is not None and sample.cell_line not in selected_cells:
             continue
         for method in METHOD_ORDER:
-            if method in selected_methods:
+            if method in selected_methods or (
+                method == "skype" and needs_native_limits
+            ):
                 cases.append((sample, method))
     return cases
 
@@ -470,6 +599,7 @@ def limit_vcf_cases(
     cases: list[tuple[Sample, str]],
     max_vcfs: int | None,
     status: dict[str, Any] | None = None,
+    results_dir: Path | None = None,
     force: bool = False,
 ) -> list[tuple[Sample, str]]:
     if max_vcfs is None:
@@ -484,10 +614,15 @@ def limit_vcf_cases(
             continue
         if (
             not force
-            and completed_metrics(
-                completed_runs.get(run_key(sample.cell_line, method))
-            )
-            is not None
+            and status is not None
+            and results_dir is not None
+            and completed_case_metrics(
+                completed_runs.get(run_key(sample.cell_line, method)),
+                sample,
+                method,
+                status,
+                results_dir,
+            ) is not None
         ):
             limited.append((sample, method))
         elif selected_vcfs.get(sample.cell_line, 0) < max_vcfs:
@@ -499,7 +634,7 @@ def limit_vcf_cases(
 
 
 def command_for_case(
-    sample: Sample, method: str, results_dir: Path
+    sample: Sample, method: str, results_dir: Path, thread: int, depth: int
 ) -> tuple[list[str], Path, Path, bool, Path | None]:
     log_path = results_dir / "logs" / sample.cell_line / f"{method}.log"
     artifact_dir = results_dir / "artifacts" / sample.cell_line / method
@@ -518,9 +653,9 @@ def command_for_case(
             "--option_02=--variant_mode",
             "--skype_force",
             "-t",
-            str(THREAD),
+            str(thread),
             "-d",
-            str(DEPTH),
+            str(depth),
             str(cell_root),
             str(sample.raw_read),
         ]
@@ -528,6 +663,12 @@ def command_for_case(
         return command, output_dir, log_path, False, artifact_dir
 
     vcf_path = sample.vcfs[method]
+    native_limits_path = native_limit_combinations_path(
+        results_dir, sample.cell_line
+    )
+    option_02 = shlex.join(
+        ["--limit_combinations", str(native_limits_path)]
+    )
     command = [
         str(SKYPE_PYTHON),
         str(ACCTOOLS_SKYPE),
@@ -540,10 +681,11 @@ def command_for_case(
         "hg38",
         "--benchmark_vcf_loc",
         str(vcf_path),
+        f"--option_02={option_02}",
         "-t",
-        str(THREAD),
+        str(thread),
         "-d",
-        str(DEPTH),
+        str(depth),
         "--skype_force",
         str(DATA_ROOT / sample.cell_line),
         str(sample.raw_read),
@@ -571,11 +713,33 @@ def remove_cell_pipeline_outputs(cell_line: str) -> None:
 
 
 def run_one_case(
-    sample: Sample, method: str, results_dir: Path
+    sample: Sample,
+    method: str,
+    results_dir: Path,
+    thread: int,
+    depth: int,
+    expected_limit_combinations: tuple[int, int] | None = None,
 ) -> dict[str, Any]:
     command, output_dir, log_path, vcf_mode, snapshot_dir = command_for_case(
-        sample, method, results_dir
+        sample, method, results_dir, thread, depth
     )
+    if vcf_mode:
+        if expected_limit_combinations is None:
+            raise BenchError(
+                f"native limit_combinations were not supplied for "
+                f"{sample.cell_line}/{method}"
+            )
+        native_limits_path = native_limit_combinations_path(
+            results_dir, sample.cell_line
+        )
+        source_limit_combinations = read_limit_combinations(native_limits_path)
+        if source_limit_combinations != expected_limit_combinations:
+            raise BenchError(
+                f"native limit_combinations changed before "
+                f"{sample.cell_line}/{method}: expected="
+                f"{expected_limit_combinations}, actual={source_limit_combinations}"
+            )
+
     returncode, started_ns, started_at, finished_at = run_pipeline(command, log_path)
     base_record: dict[str, Any] = {
         "cell_line": sample.cell_line,
@@ -599,8 +763,26 @@ def run_one_case(
         )
 
     ensure_fresh_output(output_dir, vcf_mode, started_ns)
+    actual_limit_combinations = read_limit_combinations(
+        output_dir / LIMIT_COMBINATIONS_JSON
+    )
+    if (
+        expected_limit_combinations is not None
+        and actual_limit_combinations != expected_limit_combinations
+    ):
+        raise BenchError(
+            f"pipeline used unexpected limit_combinations for "
+            f"{sample.cell_line}/{method}: expected={expected_limit_combinations}, "
+            f"actual={actual_limit_combinations}"
+        )
     metrics = collect_metrics(output_dir, log_path, vcf_mode)
-    base_record.update({"status": "complete", "metrics": metrics})
+    base_record.update(
+        {
+            "status": "complete",
+            "metrics": metrics,
+            "limit_combinations": list(actual_limit_combinations),
+        }
+    )
 
     if snapshot_dir is not None:
         snapshot_output(output_dir, snapshot_dir, base_record)
@@ -662,6 +844,20 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "-t",
+        "--thread",
+        type=int,
+        default=THREAD,
+        help=f"Number of pipeline threads (default: {THREAD}).",
+    )
+    parser.add_argument(
+        "-d",
+        "--depth",
+        type=int,
+        default=DEPTH,
+        help=f"Breakend graph depth (default: {DEPTH}).",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Rerun completed selected cases; previous artifacts are preserved.",
@@ -683,6 +879,10 @@ def main() -> int:
     args = parse_args()
     if args.max_vcfs is not None and args.max_vcfs < 1:
         raise BenchError("--max-vcfs must be at least 1")
+    if args.thread < 1:
+        raise BenchError("--thread must be at least 1")
+    if args.depth < 1:
+        raise BenchError("--depth must be at least 1")
     input_csv = absolute_path(args.input)
     vcf_root = absolute_path(args.vcf_root)
     results_dir = absolute_path(args.results_dir)
@@ -719,7 +919,7 @@ def main() -> int:
     if args.dry_run:
         for sample, method in cases:
             command, output_dir, log_path, _, _ = command_for_case(
-                sample, method, results_dir
+                sample, method, results_dir, args.thread, args.depth
             )
             print(f"{sample.cell_line}\t{method}\t{shlex.join(command)}")
             print(f"  output={output_dir}")
@@ -738,14 +938,25 @@ def main() -> int:
 
         status_path = results_dir / "status.json"
         status = load_status(status_path)
-        cases = limit_vcf_cases(cases, args.max_vcfs, status, args.force)
+        cases = limit_vcf_cases(
+            cases,
+            args.max_vcfs,
+            status=status,
+            results_dir=results_dir,
+            force=args.force,
+        )
         failures = 0
         cleaned_cells: set[str] = set()
 
         for index, (sample, method) in enumerate(cases, start=1):
             key = run_key(sample.cell_line, method)
             previous = status["runs"].get(key)
-            if not args.force and completed_metrics(previous) is not None:
+            if (
+                not args.force
+                and completed_case_metrics(
+                    previous, sample, method, status, results_dir
+                ) is not None
+            ):
                 print(
                     f"SKIP  [{index}/{len(cases)}] {sample.cell_line}/{method} "
                     "(already complete)",
@@ -758,10 +969,24 @@ def main() -> int:
                 flush=True,
             )
             try:
+                expected_limit_combinations = None
+                if method != "skype":
+                    expected_limit_combinations = (
+                        native_limit_combinations_from_status(
+                            status, sample, results_dir
+                        )
+                    )
                 if sample.cell_line not in cleaned_cells:
                     remove_cell_pipeline_outputs(sample.cell_line)
                     cleaned_cells.add(sample.cell_line)
-                record = run_one_case(sample, method, results_dir)
+                record = run_one_case(
+                    sample,
+                    method,
+                    results_dir,
+                    args.thread,
+                    args.depth,
+                    expected_limit_combinations,
+                )
             except KeyboardInterrupt:
                 status["runs"][key] = {
                     "status": "interrupted",
@@ -770,7 +995,7 @@ def main() -> int:
                     "finished_at": now_iso(),
                 }
                 atomic_write_json(status_path, status)
-                write_summary_csv(output_csv, samples, status)
+                write_summary_csv(output_csv, samples, status, results_dir)
                 raise
             except Exception as exc:
                 failures += 1
@@ -787,26 +1012,32 @@ def main() -> int:
                 print(f"FAIL  {sample.cell_line}/{method}: {exc}", file=sys.stderr)
             status["runs"][key] = record
             atomic_write_json(status_path, status)
-            rows = write_summary_csv(output_csv, samples, status)
+            rows = write_summary_csv(output_csv, samples, status, results_dir)
             if record.get("status") == "complete":
                 metrics = record["metrics"]
                 print(
                     f"METRIC {sample.cell_line}/{method}: "
                     f"nclose={metrics['nclose_count']} "
                     f"indel={metrics['indel_count']} "
-                    f"relative_error={metrics['relative_error']:.4f} "
+                    "denoised_relative_error="
+                    f"{metrics['denoised_relative_error']:.4f} "
                     f"(CSV rows={rows})",
                     flush=True,
                 )
             if failures and args.fail_fast:
                 break
 
-        rows = write_summary_csv(output_csv, samples, status)
+        rows = write_summary_csv(output_csv, samples, status, results_dir)
         selected_incomplete = [
             run_key(sample.cell_line, method)
             for sample, method in cases
-            if completed_metrics(status["runs"].get(run_key(sample.cell_line, method)))
-            is None
+            if completed_case_metrics(
+                status["runs"].get(run_key(sample.cell_line, method)),
+                sample,
+                method,
+                status,
+                results_dir,
+            ) is None
         ]
         print(f"Summary: {output_csv} ({rows} completed rows)", flush=True)
         print(f"Status:  {status_path}", flush=True)
