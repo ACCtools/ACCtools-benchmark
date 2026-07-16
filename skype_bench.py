@@ -66,6 +66,7 @@ SNAPSHOT_FILES = (
     "karyotype_filter.txt",
     "karyotype_cluster.txt",
     "nclose_nodes_index.txt",
+    "nclose_report.tsv",
     "conjoined_type4_ins_del.pkl",
     "vcf_type4_events.pkl",
     "vcf_mode_summary.json",
