@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import importlib.util
 import json
 from pathlib import Path
@@ -112,6 +113,80 @@ class SkypeBenchLimitCombinationTests(unittest.TestCase):
                 )
             )
 
+
+class SkypeBenchNcloseMetricTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.output_dir = self.root / "output"
+        self.output_dir.mkdir()
+        self.log_path = self.root / "pipeline.log"
+        self.log_path.write_text(
+            "INFO: Denoised relative error : 0.125\n",
+            encoding="utf-8",
+        )
+        (self.output_dir / "vcf_mode_summary.tsv").write_text(
+            "metric\tvalue\nused_type4_events\t3\n",
+            encoding="utf-8",
+        )
+
+    def write_nclose_report(self, report_count: int) -> Path:
+        report_path = self.output_dir / skype_bench.NCLOSE_REPORT_TSV
+        with report_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=skype_bench.NCLOSE_REPORT_COLUMNS,
+                delimiter="\t",
+                lineterminator="\n",
+            )
+            writer.writeheader()
+            for index in range(1, report_count + 1):
+                writer.writerow({"nclose_id": f"SKYPE.nclose.{index}"})
+        return report_path
+
+    def test_collect_metrics_uses_nclose_report_rows(self) -> None:
+        self.write_nclose_report(report_count=2)
+        # The old source deliberately has a different count.  This verifies
+        # that collect_metrics no longer reads nclose_nodes_index.txt.
+        (self.output_dir / "nclose_nodes_index.txt").write_text(
+            "1\n2\n3\n4\n5\n",
+            encoding="utf-8",
+        )
+
+        metrics = skype_bench.collect_metrics(
+            self.output_dir,
+            self.log_path,
+            vcf_mode=True,
+        )
+
+        self.assertEqual(metrics["nclose_count"], 2)
+        self.assertEqual(metrics["indel_count"], 3)
+        self.assertEqual(metrics["denoised_relative_error"], 0.125)
+
+    def test_collect_metrics_counts_header_only_report_as_zero(self) -> None:
+        self.write_nclose_report(report_count=0)
+
+        metrics = skype_bench.collect_metrics(
+            self.output_dir,
+            self.log_path,
+            vcf_mode=True,
+        )
+
+        self.assertEqual(metrics["nclose_count"], 0)
+
+    def test_count_nclose_reports_rejects_unexpected_schema(self) -> None:
+        report_path = self.output_dir / skype_bench.NCLOSE_REPORT_TSV
+        report_path.write_text(
+            "nclose_id\tstart_chr\nSKYPE.nclose.1\tchr1\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            skype_bench.BenchError,
+            "unexpected NClose report header",
+        ):
+            skype_bench.count_nclose_reports(report_path)
 
 if __name__ == "__main__":
     unittest.main()

@@ -22,7 +22,7 @@ directory.
 
 Metric definitions:
 
-* nclose_count: number of entries in nclose_nodes_index.txt
+* nclose_count: number of report rows emitted in nclose_report.tsv
 * indel_count: native type-4 indels, or VCF-mode used_type4_events
 * denoised_relative_error: ``Denoised relative error`` emitted by
   23_run_nnls.py, using the CASTLE-HiFi-calibrated chromosome/run-wise TV
@@ -99,6 +99,22 @@ CSV_COLUMNS = (
 STATUS_VERSION = 1
 CELL_PIPELINE_OUTPUT_DIRS = ("30_skype", "31_skype_hg38")
 LIMIT_COMBINATIONS_JSON = "limit_combinations.json"
+NCLOSE_REPORT_TSV = "nclose_report.tsv"
+NCLOSE_REPORT_COLUMNS = (
+    "nclose_id",
+    "start_chr",
+    "start_pos",
+    "start_dir",
+    "end_chr",
+    "end_pos",
+    "end_dir",
+    "nclose_cn",
+    "nclose_cn_reason",
+    "nclose_filter",
+    "nclose_filter_reason",
+    "nclose_cluster",
+    "nclose_cluster_reason",
+)
 
 
 @dataclass(frozen=True)
@@ -400,10 +416,15 @@ def write_summary_csv(
     return rows_written
 
 
-def count_nonempty_lines(path: Path) -> int:
-    require_file(path, "NClose index")
-    with path.open(encoding="utf-8", errors="strict") as handle:
-        return sum(1 for line in handle if line.strip())
+def count_nclose_reports(path: Path) -> int:
+    require_nonempty_file(path, "NClose report")
+    with path.open(newline="", encoding="utf-8", errors="strict") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        if tuple(reader.fieldnames or ()) != NCLOSE_REPORT_COLUMNS:
+            raise BenchError(
+                f"unexpected NClose report header in {path}: {reader.fieldnames}"
+            )
+        return sum(1 for _row in reader)
 
 
 def read_metric_tsv(path: Path) -> dict[str, str]:
@@ -454,7 +475,7 @@ def read_denoised_relative_error(log_path: Path) -> float:
 
 
 def collect_metrics(output_dir: Path, log_path: Path, vcf_mode: bool) -> dict[str, Any]:
-    nclose_count = count_nonempty_lines(output_dir / "nclose_nodes_index.txt")
+    nclose_count = count_nclose_reports(output_dir / NCLOSE_REPORT_TSV)
     if vcf_mode:
         summary = read_metric_tsv(output_dir / "vcf_mode_summary.tsv")
         value = summary.get("used_type4_events")
@@ -479,7 +500,7 @@ def collect_metrics(output_dir: Path, log_path: Path, vcf_mode: bool) -> dict[st
 
 def ensure_fresh_output(output_dir: Path, vcf_mode: bool, started_ns: int) -> None:
     required = [
-        output_dir / "nclose_nodes_index.txt",
+        output_dir / NCLOSE_REPORT_TSV,
         output_dir / "karyotype.txt",
         output_dir / LIMIT_COMBINATIONS_JSON,
     ]
@@ -489,7 +510,7 @@ def ensure_fresh_output(output_dir: Path, vcf_mode: bool, started_ns: int) -> No
         required.append(output_dir / "conjoined_type4_ins_del.pkl")
     for path in required:
         require_file(path, "pipeline output")
-        if path.name != "nclose_nodes_index.txt" and path.stat().st_size == 0:
+        if path.stat().st_size == 0:
             raise BenchError(f"pipeline output is empty: {path}")
         # Allow two seconds for filesystems with coarse timestamp precision.
         if path.stat().st_mtime_ns + 2_000_000_000 < started_ns:
